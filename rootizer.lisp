@@ -52,21 +52,28 @@
 (defun players-circle-key (game)
   (format nil "~a-players-circle" game))
 
+(defun players-static-key (game)
+  (format nil "~a-players-static" game))
+
 (defun all-turns-key (game)
   (format nil "~a-all-turns" game))
 
 (defun game-last-updated-key (game)
   (format nil "~a-last-updated" game))
 
+(defun player-total-key (game player)
+  (format nil "~a-~a-total" game player))
+
 (defun new-game (players)
   (with-lock
     (let ((new-game (red:incr +current-game-key+)))
       (red:set (game-last-updated-key new-game) (get-epoch-time))
       (apply #'red:lpush (players-circle-key new-game) (reverse players))
+      (apply #'red:lpush (players-static-key new-game) (reverse players))
       new-game)))
 
 (defun get-players (game)
-  (red:lrange (players-circle-key game) 0 -1))
+  (red:lrange (players-static-key game) 0 -1))
 
 (defun get-lock-id ()
   (format nil "~a-~a" (get-universal-time) (random 10000)))
@@ -128,19 +135,41 @@ end
   (map 'vector #'identity list))
 
 (defun get-all-turns (game)
-  (with-lock
-    (list-to-array
-     (mapcar
-      (lambda (x) (str:split "-" x))
-      (red:lrange (all-turns-key game) -10 -1)))))
+  (list-to-array
+   (mapcar
+    (lambda (x) (str:split "-" x))
+    (red:lrange (all-turns-key game) -10 -1))))
+
+(defun get-player-total (game player)
+  (let ((as-string (red:get (player-total-key game player))))
+    (if (null as-string)
+        nil
+        (parse-integer as-string))))
+
+(defun get-number-turns (game player)
+  (red:llen (player-turns-key game player)))
+
+(defun get-player-averages (game)
+  (i:iterate
+    (i:with players = (get-players game))
+    (i:for player in players)
+    (i:for total = (get-player-total game player))
+    (when (null total)
+      (i:collect `(,player . 0))
+      (i:next-iteration))
+    (i:for num-turns = (get-number-turns game player))
+    (i:collect `(,player . ,(/ total num-turns)))))
 
 (defun get-game-data (game)
-  (let ((current-player (get-current-player game))
-        (last-time (get-last-time game))
-        (turns (get-all-turns game)))
-    `(("current_player" . ,current-player)
-      ("last_time" . ,last-time)
-      ("turns" . ,turns))))
+  (with-lock
+    (let ((current-player (get-current-player game))
+          (last-time (get-last-time game))
+          (turns (get-all-turns game))
+          (averages (get-player-averages game)))
+      `(("current_player" . ,current-player)
+        ("last_time" . ,last-time)
+        ("turns" . ,turns)
+        ("averages" . ,averages)))))
 
 (defun submit-time (game)
   (with-lock
@@ -151,6 +180,7 @@ end
       (red:set (game-last-updated-key game) new-time)
       (red:rpush (player-turns-key game player) time-diff)
       (red:rpush (all-turns-key game) (format nil "~a-~a" player time-diff))
+      (red:incrby (player-total-key game player) time-diff)
       (send-update game))))
 
 
@@ -175,51 +205,48 @@ end
     `(let (,@let-bindings)
        ,@body)))
 
+(defmacro redis-json-endpoint ((&rest parameters) &body body)
+  `(redis:with-connection ()
+     (with-parameters (,@parameters)
+       (set-json-headers)
+       ,@body)))
 
 (defun game-data-endpoint ()
-  (redis:with-connection ()
-    (set-json-headers)
-    (with-parameters (game)
-      (json:encode-json-alist-to-string (get-game-data game)))))
+  (redis-json-endpoint (game)
+    (json:encode-json-alist-to-string (get-game-data game))))
 
 (defun submit-endpoint ()
-  (redis:with-connection ()
-    (with-parameters (game)
-      (submit-time game)
-      (require-post)
-      (set-json-headers)
-      "{\"message\": \"successfully submitted turn\"}")))
+  (redis-json-endpoint (game)
+    (submit-time game)
+    (require-post)
+    "{\"message\": \"successfully submitted turn\"}"))
 
 (defun new-game-endpoint ()
-  (redis:with-connection ()
-    (with-parameters (players)
-      (let* ((players-list (str:split "," players))
-             (game-number (new-game players-list)))
-        (set-json-headers)
-        (require-post)
-        (json:encode-json-alist-to-string `(("game_number" . ,game-number)))))))
+  (redis-json-endpoint (players)
+    (let* ((players-list (str:split "," players))
+           (game-number (new-game players-list)))
+      (require-post)
+      (json:encode-json-alist-to-string `(("game_number" . ,game-number))))))
 
 (defun select-factions-endpoint ()
   (with-parameters (player_count)
+    (set-json-headers)
     (let* ((factions (if (null player_count)
                          (error "no player count provided")
                          (select-factions (parse-integer player_count)))))
-      (set-json-headers)
       (json:encode-json-alist-to-string
        `(("factions" . ,factions))))))
 
 (defun latest-game-endpoint ()
-  (redis:with-connection ()
+  (redis-json-endpoint () 
     (let* ((latest-game (red:get +current-game-key+)))
-      (set-json-headers)
       (json:encode-json-alist-to-string
        `(("game_number" . ,latest-game))))))
 
 (defun players-endpoint ()
-  (redis:with-connection ()
-    (with-parameters (game)
-      (set-json-headers)
-      (json:encode-json-to-string (get-players game)))))
+  (redis-json-endpoint (game)
+    (set-json-headers)
+    (json:encode-json-to-string (get-players game))))
 
 (defmacro add-route (path func)
   `(push
