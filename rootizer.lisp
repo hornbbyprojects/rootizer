@@ -100,10 +100,11 @@ end
 (defmacro with-lock (&body body)
   (alexandria:with-gensyms (lock-id ret)
     `(let ((,lock-id (get-lock-id)))
-       (create-lock ,lock-id)
-       (let ((,ret (progn ,@body)))
-         (delete-lock ,lock-id)
-         ,ret))))
+       (unwind-protect 
+            (progn
+              (create-lock ,lock-id)
+              ,@body)
+           (delete-lock ,lock-id)))))
 
 (defun turn-times-key (game)
   (format nil "~a-turn-times" game))
