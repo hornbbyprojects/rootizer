@@ -1,8 +1,7 @@
 (defpackage :rootizer
   (:use #:cl)
   (:local-nicknames (:i :iterate))
-  (:export #:start-server
-           ))
+  (:export #:start-server))
 
 (in-package :rootizer)
 
@@ -62,10 +61,12 @@
 (defun new-game (players)
   (with-lock
     (let ((new-game (red:incr +current-game-key+)))
-      (red:set (game-last-updated-key new-game) (get-universal-time))
+      (red:set (game-last-updated-key new-game) (get-epoch-time))
       (apply #'red:lpush (players-circle-key new-game) (reverse players))
       new-game)))
 
+(defun get-players (game)
+  (red:lrange (players-circle-key game) 0 -1))
 
 (defun get-lock-id ()
   (format nil "~a-~a" (get-universal-time) (random 10000)))
@@ -102,7 +103,7 @@ end
 (defun player-turns-key (game player)
   (format nil "~a-~a-turns" game player))
 
-(defun current-player (game)
+(defun get-current-player (game)
   (car (red:lrange (players-circle-key game) 0 0)))
 
 (defun switch-to-next-player (game)
@@ -112,18 +113,45 @@ end
 (defun current-game ()
   (red:get +current-game-key+))
 
-(defun submit-time ()
+(defconstant +epoch-start+ (encode-universal-time 0 0 0 1 1 1970 0))
+(defun convert-universal-time-to-epoch-time (universal-time)
+  (- universal-time +epoch-start+))
+
+(defun get-epoch-time ()
+  (convert-universal-time-to-epoch-time (get-universal-time)))
+
+(defun get-last-time (game)
+  (parse-integer (red:get (game-last-updated-key game))))
+
+
+(defun list-to-array (list)
+  (map 'vector #'identity list))
+
+(defun get-all-turns (game)
   (with-lock
-    (let* ((game (current-game))
-           (player (switch-to-next-player game))
-           (next-player (current-player game))
-           (last-time (parse-integer (red:get (game-last-updated-key game))))
-           (new-time (get-universal-time))
+    (list-to-array
+     (mapcar
+      (lambda (x) (str:split "-" x))
+      (red:lrange (all-turns-key game) -10 -1)))))
+
+(defun get-game-data (game)
+  (let ((current-player (get-current-player game))
+        (last-time (get-last-time game))
+        (turns (get-all-turns game)))
+    `(("current_player" . ,current-player)
+      ("last_time" . ,last-time)
+      ("turns" . ,turns))))
+
+(defun submit-time (game)
+  (with-lock
+    (let* ((player (switch-to-next-player game))
+           (last-time (get-last-time game))
+           (new-time (get-epoch-time))
            (time-diff (- new-time last-time)))
       (red:set (game-last-updated-key game) new-time)
       (red:rpush (player-turns-key game player) time-diff)
       (red:rpush (all-turns-key game) (format nil "~a-~a" player time-diff))
-      (list game player next-player time-diff))))
+      (send-update game))))
 
 
 (defun require-post ()
@@ -134,77 +162,114 @@ end
   (setf (hunchentoot:header-out "Content-Type") "application/json")
   (setf (hunchentoot:header-out "Access-Control-Allow-Origin") "*"))
 
+(defun prin1-symbol-lower (symbol)
+  (let ((*print-case* :downcase)) (prin1-to-string symbol)))
+
+(defmacro with-parameters ((&rest parameters) &body body)
+  (let ((let-bindings
+          (mapcar
+           (lambda (parameter)
+             `(,parameter (hunchentoot:get-parameter
+                           ,(prin1-symbol-lower parameter))))
+           parameters)))
+    `(let (,@let-bindings)
+       ,@body)))
 
 
-(defun get-all-turns (game)
-  (with-lock
-    (mapcar (lambda (x) (str:split "-" x)) (red:lrange (all-turns-key game) 0 -1))))
-
-(defun all-turns-endpoint ()
+(defun game-data-endpoint ()
   (redis:with-connection ()
     (set-json-headers)
-    (let ((game (hunchentoot:get-parameter "game")))
-      (json:encode-json-to-string (get-all-turns game)))))
-
-(defun current-player-endpoint ()
-  (redis:with-connection ()
-    (set-json-headers)
-    (let ((game (hunchentoot:get-parameter "game")))
-      (json:encode-json-to-string (current-player game)))))
-
+    (with-parameters (game)
+      (json:encode-json-alist-to-string (get-game-data game)))))
 
 (defun submit-endpoint ()
   (redis:with-connection ()
-    (trivia:let-match (((list game player next-player time) (submit-time)))
+    (with-parameters (game)
+      (submit-time game)
       (require-post)
       (set-json-headers)
-      (json:encode-json-alist-to-string
-       `(("player" . ,player)
-         ("next-player" . ,next-player)
-         ("game_number" . ,game)
-         ("time" . ,time))))))
+      "{\"message\": \"successfully submitted turn\"}")))
 
 (defun new-game-endpoint ()
   (redis:with-connection ()
-    (let* ((players (str:split "," (hunchentoot:get-parameter "players")))
-           (game-number (new-game players)))
-      (set-json-headers)
-      (require-post)
-      (json:encode-json-alist-to-string `(("game_number" . ,game-number))))))
+    (with-parameters (players)
+      (let* ((players-list (str:split "," players))
+             (game-number (new-game players-list)))
+        (set-json-headers)
+        (require-post)
+        (json:encode-json-alist-to-string `(("game_number" . ,game-number)))))))
 
 (defun select-factions-endpoint ()
-  (let* ((player-count (hunchentoot:get-parameter "player_count"))
-         (factions (if (null player-count)
-                       (error "no player count provided")
-                       (select-factions (parse-integer player-count)))))
-    (set-json-headers)
-    (json:encode-json-alist-to-string
-     `(("factions" . ,factions)))))
+  (with-parameters (player_count)
+    (let* ((factions (if (null player_count)
+                         (error "no player count provided")
+                         (select-factions (parse-integer player_count)))))
+      (set-json-headers)
+      (json:encode-json-alist-to-string
+       `(("factions" . ,factions))))))
 
 (defun latest-game-endpoint ()
   (redis:with-connection ()
-    (let* ((latest-game (red:get +current-game-key+))
-           (latest-players (red:lrange (players-circle-key latest-game) 0 -1)))
+    (let* ((latest-game (red:get +current-game-key+)))
       (set-json-headers)
       (json:encode-json-alist-to-string
-       `(("game_number" . ,latest-game)
-         ("players" . ,latest-players))))))
+       `(("game_number" . ,latest-game))))))
 
+(defun players-endpoint ()
+  (redis:with-connection ()
+    (with-parameters (game)
+      (set-json-headers)
+      (json:encode-json-to-string (get-players game)))))
 
 (defmacro add-route (path func)
   `(push
      (hunchentoot:create-prefix-dispatcher ,path ,func)
      hunchentoot:*dispatch-table*))
+
+(defclass client (hunchensocket:websocket-client)
+  ((game :initarg :game :reader client-game)))
+
+(defmethod initialize-instance :after ((client client) &key &allow-other-keys)
+  (with-slots (game hunchensocket::request) client
+    (setf game (hunchentoot:get-parameter "game" hunchensocket::request))))
+
+(defclass notifier (hunchensocket:websocket-resource) ()
+  (:default-initargs :client-class 'client))
+
+
+(defvar *notifier*)
+(defvar *notifier-server*)
+(defvar *server*)
+
+(defun send-update (game)
+  (format t "sending update for ~a~%" game)
+  (dolist (client (hunchensocket:clients *notifier*))
+    (if (equal (client-game client) game)
+        (progn
+          (format t "Sending update to ~a~%" client)
+          (hunchensocket:send-text-message client ""))
+        (format t "skipping client with game ~a~%" (client-game client)))))
+
+(defun start-notifier ()
+  (setf *notifier* (make-instance 'notifier))
+  (pushnew (lambda (request) (declare (ignore request)) *notifier*) hunchensocket:*websocket-dispatch-table*)
+  (setf *notifier-server* (make-instance 'hunchensocket:websocket-acceptor :port 9090))
+  (hunchentoot:start *notifier-server*))
+
 (defun start-server ()
-  (if (boundp '*server*)
+  (if (and (boundp '*server*) (hunchentoot::acceptor-listen-socket *server*))
       (hunchentoot:stop *server*))
+  (if (and (boundp '*notifier-server*) (hunchentoot::acceptor-listen-socket *notifier-server*))
+      (hunchentoot:stop *notifier-server*))
   (setf hunchentoot:*dispatch-table* nil)
+  (setf hunchensocket:*websocket-dispatch-table* nil)
+  (start-notifier)
   (add-route "/submit" #'submit-endpoint)
   (add-route "/new-game" #'new-game-endpoint)
   (add-route "/select-factions" #'select-factions-endpoint)
   (add-route "/latest-game" #'latest-game-endpoint)
-  (add-route "/all-turns" #'all-turns-endpoint)
-  (add-route "/current-player" #'current-player-endpoint)
-  (defvar *server* (make-instance 'hunchentoot:easy-acceptor :port 8080))
+  (add-route "/game-data" #'game-data-endpoint)
+  (add-route "/players" #'players-endpoint)
+  (setf *server* (make-instance 'hunchentoot:easy-acceptor :port 8080))
   (hunchentoot:start *server*))
 
