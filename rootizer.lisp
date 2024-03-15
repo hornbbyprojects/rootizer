@@ -1,7 +1,7 @@
 (defpackage :rootizer
   (:use #:cl)
   (:local-nicknames (:i :iterate))
-  (:export #:start-server))
+  (:export #:start-server #:start-server-blocking))
 
 (in-package :rootizer)
 
@@ -48,21 +48,41 @@
     (reverse selected)))
 
 
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defun repeat (n x)
+    (if (= n 0)
+        nil
+        (cons x (repeat (1- n) x)))))
 
-(defun players-circle-key (game)
-  (format nil "~a-players-circle" game))
+(defmacro defkey (key-name &rest args)
+  (when (null args)
+    (setf args '(game)))
+  (let* ((format-args (cons (string key-name) args))
+         (format-str (str:join "-" (repeat (length format-args) "~a"))))
+    `(defun ,(read-from-string (format nil "~a-key" key-name)) (,@args) (format nil ,format-str ,@format-args))))
 
-(defun players-static-key (game)
-  (format nil "~a-players-static" game))
+(defkey players-circle)
 
-(defun all-turns-key (game)
-  (format nil "~a-all-turns" game))
+(defkey players-static)
 
-(defun game-last-updated-key (game)
-  (format nil "~a-last-updated" game))
+(defkey all-turns)
 
-(defun player-total-key (game player)
-  (format nil "~a-~a-total" game player))
+(defkey game-last-updated)
+
+(defkey player-total game player)
+
+(defkey turn-times)
+
+(defkey player-turns game player)
+
+(defmacro with-lock (&body body)
+  (alexandria:with-gensyms (lock-id)
+    `(let ((,lock-id (get-lock-id)))
+       (unwind-protect 
+            (progn
+              (create-lock ,lock-id)
+              ,@body)
+         (delete-lock ,lock-id)))))
 
 (defun new-game (players)
   (with-lock
@@ -97,19 +117,8 @@ end
 (defun delete-lock (lock-id)
   (red:eval +delete-lock-script+ 1 +lock-key+ lock-id))
 
-(defmacro with-lock (&body body)
-  (alexandria:with-gensyms (lock-id ret)
-    `(let ((,lock-id (get-lock-id)))
-       (unwind-protect 
-            (progn
-              (create-lock ,lock-id)
-              ,@body)
-           (delete-lock ,lock-id)))))
 
-(defun turn-times-key (game)
-  (format nil "~a-turn-times" game))
-(defun player-turns-key (game player)
-  (format nil "~a-~a-turns" game player))
+
 
 (defun get-current-player (game)
   (car (red:lrange (players-circle-key game) 0 0)))
@@ -193,8 +202,9 @@ end
   (setf (hunchentoot:header-out "Content-Type") "application/json")
   (setf (hunchentoot:header-out "Access-Control-Allow-Origin") "*"))
 
-(defun prin1-symbol-lower (symbol)
-  (let ((*print-case* :downcase)) (prin1-to-string symbol)))
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defun prin1-symbol-lower (symbol)
+    (let ((*print-case* :downcase)) (prin1-to-string symbol))))
 
 (defmacro with-parameters ((&rest parameters) &body body)
   (let ((let-bindings
@@ -300,4 +310,10 @@ end
   (add-route "/players" #'players-endpoint)
   (setf *server* (make-instance 'hunchentoot:easy-acceptor :port 8080))
   (hunchentoot:start *server*))
+
+(defun start-server-blocking ()
+  (start-server)
+  (let ((hunchenthread (find-if (lambda (x) (str:containsp "hunchentoot" (sb-thread:thread-name x))) (sb-thread:list-all-threads))))
+    (sb-thread:join-thread hunchenthread)))
+
 
